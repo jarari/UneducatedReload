@@ -17,32 +17,41 @@ ActorValueInfo* BCRAVIF = nullptr;
 BGSKeyword* chamberExclusion;
 TESObjectWEAP::InstanceData* lastWeapon = nullptr;
 
+//Sometimes the order of equip/unequip gets messed up so I'm letting the task interface to handle this.
 void QueueCapacityCheck()
 {
+	//Don't queue it multiple times
 	if (checkQueued)
 		return;
 	checkQueued = true;
 
 	std::thread([]() -> void {
+		//100 ms delay to prevent infinite loops
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		//The player might load a previous save during 100ms delay so check if it's still queued
 		if (checkQueued) {
 			taskInterface->AddTask([]() {
+				//When the player equips an item in Fallout 4, the item gets into an equip queue.
+				//If p->currentProcess->high + 0x594 == true then the item is still in the queue
 				if (*(bool*)((uintptr_t)p->currentProcess->high + 0x594)) {
 					checkQueued = false;
 					QueueCapacityCheck();
 					return;
 				}
+				//Revert previous weapon's specs since unequipping the weapon doesn't necessarily free the memory
 				if (shouldAddOne && lastWeapon) {
 					lastWeapon->ammoCapacity = ammoCapacity;
 					shouldAddOne = false;
 					lastWeapon = nullptr;
 				}
+				//Get equipped item
 				p->currentProcess->middleHigh->equippedItemsLock.lock();
 				EquippedItem& equipped = p->currentProcess->middleHigh->equippedItems[0];
 				TESObjectWEAP* wepForm = (TESObjectWEAP*)equipped.item.object;
 				TESObjectWEAP::InstanceData* instance = (TESObjectWEAP::InstanceData*)equipped.item.instanceData.get();
 				EquippedWeaponData* wepData = (EquippedWeaponData*)equipped.data.get();
 				p->currentProcess->middleHigh->equippedItemsLock.unlock();
+				//Check BCR support (not working atm), check keywords
 				if (wepData && wepForm->weaponData.skill != BCRAVIF && (!instance->keywords || !instance->keywords->HasKeyword(chamberExclusion, instance))) {
 					previousAmmoCount = wepData->ammoCount;
 					ammoCapacity = instance->ammoCapacity;
@@ -56,13 +65,17 @@ void QueueCapacityCheck()
 	}).detach();
 }
 
+//Fired when the ammo count changes.
+//This event is probably coming from the HUD UI element.
 class AmmoEventWatcher : public BSTEventSink<PlayerAmmoCountEvent>
 {
 	virtual BSEventNotifyControl ProcessEvent(const PlayerAmmoCountEvent& evn, BSTEventSource<PlayerAmmoCountEvent>* src) override
 	{
 		if (shouldAddOne) {
+			//Check if the ammo count change was due to reload
 			if (previousAmmoCount < evn.current && reloaded) {
 				reloaded = false;
+				//Get equipped item
 				p->currentProcess->middleHigh->equippedItemsLock.lock();
 				EquippedItem& equipped = p->currentProcess->middleHigh->equippedItems[0];
 				TESObjectWEAP* wepForm = (TESObjectWEAP*)equipped.item.object;
@@ -70,6 +83,7 @@ class AmmoEventWatcher : public BSTEventSink<PlayerAmmoCountEvent>
 				EquippedWeaponData* wepData = (EquippedWeaponData*)equipped.data.get();
 				p->currentProcess->middleHigh->equippedItemsLock.unlock();
 				if (wepData && instance && instance->ammo) {
+					//Check how many bullets are left in the inventory so we don't underflow the remaining counter
 					uint32_t inventoryAmmoCount = 0;
 					((TESObjectREFREx*)p)->GetItemCount(inventoryAmmoCount, instance->ammo, false);
 					if (previousAmmoCount == 0) {
@@ -77,6 +91,7 @@ class AmmoEventWatcher : public BSTEventSink<PlayerAmmoCountEvent>
 					} else {
 						wepData->ammoCount = min((uint32_t)(ammoCapacity + 1), inventoryAmmoCount);
 					}
+					//Force HUD update
 					taskInterface->AddUITask([]() {
 						F4::GameUIModel* gameUIModel = *F4::ptr_GameUIModel;
 						gameUIModel->UpdateDataModels();
@@ -89,6 +104,8 @@ class AmmoEventWatcher : public BSTEventSink<PlayerAmmoCountEvent>
 	}
 
 public:
+	//PlayerAmmoCountEvent is part of BSTGlobalEvent, which only gets initialized after the game has been fully loaded.
+	//Use its RTTI information to find the event source from the list.
 	static BSTEventSource<PlayerAmmoCountEvent>* GetEventSource()
 	{
 		for (auto it = (*F4::g_globalEvents.get())->eventSources.begin(); it != (*F4::g_globalEvents.get())->eventSources.end(); ++it) {
@@ -102,6 +119,7 @@ public:
 	F4_HEAP_REDEFINE_NEW(AmmoEventWatcher);
 };
 
+//Fired when an animation event was processed by the animation graph manager.
 class AnimationGraphEventWatcher
 {
 public:
@@ -109,11 +127,12 @@ public:
 
 	BSEventNotifyControl HookedProcessEvent(BSAnimationGraphEvent& evn, BSTEventSource<BSAnimationGraphEvent>* src)
 	{
+		//Since Actor inherits BSTEventSink<BSAnimationGraphEvent> we can get the pointer to the actor by offsetting
 		Actor* a = (Actor*)((uintptr_t)this - 0x38);
 		if (a == p) {
 			if (evn.animEvent == "reloadComplete" && shouldAddOne) {
 				reloaded = true;
-			} else if (evn.animEvent == "reloadEnd") {
+			} else if (evn.animEvent == "reloadEnd") {  //BCR hack
 				std::thread([]() -> void {
 					std::this_thread::sleep_for(std::chrono::milliseconds(520));
 					if (shouldAddOne && lastWeapon) {
@@ -141,6 +160,7 @@ protected:
 };
 std::unordered_map<uintptr_t, AnimationGraphEventWatcher::FnProcessEvent> AnimationGraphEventWatcher::fnHash;
 
+//Fired when an actor equips an item
 class EquipWatcher : public BSTEventSink<TESEquipEvent>
 {
 public:
@@ -149,6 +169,7 @@ public:
 		if (evn.a == p) {
 			TESForm* item = TESForm::GetFormByID(evn.formId);
 			if (item && item->formType == ENUM_FORM_ID::kWEAP && ((TESObjectWEAP*)item)->weaponData.type == 9) {
+				//This flag thing needs more RE. It's working but just looks weird.
 				if (evn.flag != 0x00000000ff000000) {
 					QueueCapacityCheck();
 				}
@@ -159,6 +180,7 @@ public:
 	F4_HEAP_REDEFINE_NEW(EquipEventSink);
 };
 
+//Reset variables after loading a save/starting a new game
 void ResetAmmoCountTracker()
 {
 	if (shouldAddOne && lastWeapon) {

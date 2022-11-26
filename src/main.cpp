@@ -14,8 +14,10 @@ bool checkQueued = false;
 uint32_t previousAmmoCount = 0;
 uint16_t ammoCapacity = 0;
 ActorValueInfo* BCRAVIF = nullptr;
+ActorValueInfo* BCRAVIF2 = nullptr;
 BGSKeyword* chamberExclusion;
 TESObjectWEAP::InstanceData* lastWeapon = nullptr;
+static std::vector<uint32_t> chamberedGuns;
 
 //Sometimes the order of equip/unequip gets messed up so I'm letting the task interface to handle this.
 void QueueCapacityCheck()
@@ -41,9 +43,16 @@ void QueueCapacityCheck()
 				//Revert previous weapon's specs since unequipping the weapon doesn't necessarily free the memory
 				if (shouldAddOne && lastWeapon) {
 					lastWeapon->ammoCapacity = ammoCapacity;
-					shouldAddOne = false;
 					lastWeapon = nullptr;
 				}
+				shouldAddOne = false;
+				reloaded = false;
+
+				if (p->currentProcess->middleHigh->equippedItems.size() == 0) {
+					checkQueued = false;
+					return;
+				}
+
 				//Get equipped item
 				p->currentProcess->middleHigh->equippedItemsLock.lock();
 				EquippedItem& equipped = p->currentProcess->middleHigh->equippedItems[0];
@@ -52,7 +61,7 @@ void QueueCapacityCheck()
 				EquippedWeaponData* wepData = (EquippedWeaponData*)equipped.data.get();
 				p->currentProcess->middleHigh->equippedItemsLock.unlock();
 				//Check BCR support (not working atm), check keywords
-				if (wepData && wepForm->weaponData.skill != BCRAVIF && (!instance->keywords || !instance->keywords->HasKeyword(chamberExclusion, instance))) {
+				if (equipped.equipIndex.index == 0 && wepData && wepForm->weaponData.skill != BCRAVIF && instance && (!instance->keywords || !instance->keywords->HasKeyword(chamberExclusion, instance))) {
 					previousAmmoCount = wepData->ammoCount;
 					ammoCapacity = instance->ammoCapacity;
 					instance->ammoCapacity = ammoCapacity + 1;
@@ -65,6 +74,32 @@ void QueueCapacityCheck()
 	}).detach();
 }
 
+/*uint32_t GetEquippedWeaponIndex()
+{
+	if (!p->inventoryList || p->currentProcess->middleHigh->equippedItems.size() == 0) {
+		return 0;
+	}
+
+	p->currentProcess->middleHigh->equippedItemsLock.lock();
+	EquippedItem& equipped = p->currentProcess->middleHigh->equippedItems[0];
+	TESObjectWEAP* wepForm = (TESObjectWEAP*)equipped.item.object;
+	TESObjectWEAP::InstanceData* instance = (TESObjectWEAP::InstanceData*)equipped.item.instanceData.get();
+	EquippedWeaponData* wepData = (EquippedWeaponData*)equipped.data.get();
+	p->currentProcess->middleHigh->equippedItemsLock.unlock();
+
+	if (equipped.equipIndex.index != 0) {
+		return 0;
+	}
+
+	for (auto invitem = p->inventoryList->data.begin(); invitem != p->inventoryList->data.end(); ++invitem) {
+		if (invitem->object->formType == ENUM_FORM_ID::kWEAP && invitem->stackData->IsEquipped()) {
+			TESObjectWEAP* wep = (TESObjectWEAP*)(invitem->object);
+			if (wep == wepForm) {
+			}
+		}
+	}
+}*/
+
 //Fired when the ammo count changes.
 //This event is probably coming from the HUD UI element.
 class AmmoEventWatcher : public BSTEventSink<PlayerAmmoCountEvent>
@@ -75,27 +110,30 @@ class AmmoEventWatcher : public BSTEventSink<PlayerAmmoCountEvent>
 			//Check if the ammo count change was due to reload
 			if (previousAmmoCount < evn.current && reloaded) {
 				reloaded = false;
-				//Get equipped item
-				p->currentProcess->middleHigh->equippedItemsLock.lock();
-				EquippedItem& equipped = p->currentProcess->middleHigh->equippedItems[0];
-				TESObjectWEAP* wepForm = (TESObjectWEAP*)equipped.item.object;
-				TESObjectWEAP::InstanceData* instance = (TESObjectWEAP::InstanceData*)equipped.item.instanceData.get();
-				EquippedWeaponData* wepData = (EquippedWeaponData*)equipped.data.get();
-				p->currentProcess->middleHigh->equippedItemsLock.unlock();
-				if (wepData && instance && instance->ammo) {
-					//Check how many bullets are left in the inventory so we don't underflow the remaining counter
-					uint32_t inventoryAmmoCount = 0;
-					((TESObjectREFREx*)p)->GetItemCount(inventoryAmmoCount, instance->ammo, false);
-					if (previousAmmoCount == 0) {
-						wepData->ammoCount = min(ammoCapacity, inventoryAmmoCount);
-					} else {
-						wepData->ammoCount = min((uint32_t)(ammoCapacity + 1), inventoryAmmoCount);
+
+				if (p->currentProcess->middleHigh->equippedItems.size() > 0) {
+					//Get equipped item
+					p->currentProcess->middleHigh->equippedItemsLock.lock();
+					EquippedItem& equipped = p->currentProcess->middleHigh->equippedItems[0];
+					TESObjectWEAP* wepForm = (TESObjectWEAP*)equipped.item.object;
+					TESObjectWEAP::InstanceData* instance = (TESObjectWEAP::InstanceData*)equipped.item.instanceData.get();
+					EquippedWeaponData* wepData = (EquippedWeaponData*)equipped.data.get();
+					p->currentProcess->middleHigh->equippedItemsLock.unlock();
+					if (equipped.equipIndex.index == 0 && wepData && instance && instance->ammo) {
+						//Check how many bullets are left in the inventory so we don't underflow the remaining counter
+						uint32_t inventoryAmmoCount = 0;
+						((TESObjectREFREx*)p)->GetItemCount(inventoryAmmoCount, instance->ammo, false);
+						if (previousAmmoCount == 0) {
+							wepData->ammoCount = min(ammoCapacity, inventoryAmmoCount);
+						} else {
+							wepData->ammoCount = min((uint32_t)(ammoCapacity + 1), inventoryAmmoCount);
+						}
+						//Force HUD update
+						taskInterface->AddUITask([]() {
+							F4::GameUIModel* gameUIModel = *F4::ptr_GameUIModel;
+							gameUIModel->UpdateDataModels();
+						});
 					}
-					//Force HUD update
-					taskInterface->AddUITask([]() {
-						F4::GameUIModel* gameUIModel = *F4::ptr_GameUIModel;
-						gameUIModel->UpdateDataModels();
-					});
 				}
 			}
 		}
@@ -129,13 +167,14 @@ public:
 	{
 		//Since Actor inherits BSTEventSink<BSAnimationGraphEvent> we can get the pointer to the actor by offsetting
 		Actor* a = (Actor*)((uintptr_t)this - 0x38);
-		if (a == p) {
-			if (evn.animEvent == "reloadComplete" && shouldAddOne) {
+		if (shouldAddOne && a == p) {
+			if (evn.animEvent == "reloadComplete") {
 				reloaded = true;
 			} else if (evn.animEvent == "reloadEnd") {  //BCR hack
-				std::thread([]() -> void {
+				TESObjectWEAP::InstanceData* queuedInstance = lastWeapon;
+				std::thread([queuedInstance]() -> void {
 					std::this_thread::sleep_for(std::chrono::milliseconds(520));
-					if (shouldAddOne && lastWeapon) {
+					if (lastWeapon == queuedInstance) {
 						lastWeapon->ammoCapacity = ammoCapacity + 1;
 					}
 				}).detach();
@@ -233,6 +272,29 @@ void TryHookAmmoWatcher()
 	}
 }
 
+void ECOIntegration()
+{
+	BGSListForm* gunMenuMesg = (BGSListForm*)GetFormFromMod("ECO.esp", 0xAA3);
+	BGSListForm* gunMenuFlst = (BGSListForm*)GetFormFromMod("ECO.esp", 0xAA4);
+	BGSMessage* gunMenuQuick = (BGSMessage*)GetFormFromMod("ECO.esp", 0xAA8);
+	BGSMod::Attachment::Mod* gunSpecialOMOD = (BGSMod::Attachment::Mod*)GetFormFromMod("ECO.esp", 0x8F2);
+	if (gunMenuMesg && gunMenuFlst && gunMenuQuick) {
+		_MESSAGE("ECO Found.");
+		MemoryManager& mm = MemoryManager::GetSingleton();
+		MESSAGEBOX_BUTTON* btn_UR = (MESSAGEBOX_BUTTON*)mm.Allocate(sizeof(MESSAGEBOX_BUTTON), 0, false);
+		new (btn_UR) BSFixedStringCS("[G] Uneducated Reload");
+		gunMenuQuick->AddButton(btn_UR);
+
+		gunMenuMesg->arrayOfForms.push_back(GetFormFromMod("UneducatedReload.esm", 0x805));
+		_MESSAGE("Gun Menu Mesg %llx", gunMenuMesg);
+		gunMenuFlst->arrayOfForms.push_back(GetFormFromMod("UneducatedReload.esm", 0x801));
+		_MESSAGE("Gun Menu Flst %llx", gunMenuFlst);
+
+		gunSpecialOMOD->attachParents.AddKeyword((BGSKeyword*)GetFormFromMod("UneducatedReload.esm", 0x802));
+		_MESSAGE("AttachPoint OMOD %llx %d", gunSpecialOMOD, gunSpecialOMOD->attachParents.size);
+	}
+}
+
 void InitializePlugin()
 {
 	p = PlayerCharacter::GetSingleton();
@@ -240,7 +302,9 @@ void InitializePlugin()
 	EquipWatcher* ew = new EquipWatcher();
 	EquipEventSource::GetSingleton()->RegisterSink(ew);
 	BCRAVIF = (ActorValueInfo*)TESForm::GetFormByID(0x300);
+	BCRAVIF2 = (ActorValueInfo*)TESForm::GetFormByID(0x2FC);
 	chamberExclusion = (BGSKeyword*)GetFormFromMod("UneducatedReload.esm", 0x800);
+	ECOIntegration();
 }
 
 extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a_f4se, F4SE::PluginInfo* a_info)
